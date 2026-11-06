@@ -444,6 +444,55 @@ void HttpServer::epollstart()           //epoll树创建和循环wait
     tmp.events=EPOLLIN|EPOLLET;     tmp.data.fd=lfd;
     ret=Epoll_ctl(this->efd,EPOLL_CTL_ADD,this->lfd,&tmp);
 
+    int thread_num=std::thread::hardware_concurrency();
+    for(int i=0;i<thread_num;i++)
+    {
+        auto w=std::make_shared<Worker>(i);
+        workers.push_back(w);
+        std::thread([w]{
+            w->run();
+        }).detach();
+    }
+    epoll_event events[1024];       //max epoll 1024
+    int current_worker = 0; // 轮询分配
+    while(1)
+    {
+        int n=Epoll_wait(this->efd,events,1024,2000);
+        for(int i=0;i<n;i++)
+        {
+            if(events[i].data.fd==lfd)
+            {
+                while (true)
+                {
+                    sockaddr_in cli_addr;
+                    socklen_t cli_len = sizeof(cli_addr);
+                    int cfd = ::accept4(lfd, (sockaddr*)&cli_addr, &cli_len,SOCK_NONBLOCK | SOCK_CLOEXEC);
+                    if(cfd<0)
+                    {
+                        if (errno == EAGAIN || errno == EWOULDBLOCK)break;              // 抽干了，退出循环
+                        else if (errno == EINTR) continue;
+                        perror("Accept4 epollstart");
+                        break; 
+                    }
+                    workers[current_worker]->addConn(cfd);
+                    current_worker=(current_worker+1)%workers.size();
+                }
+            }
+        }
+    }
+}
+//Worker----------------------------
+void Worker::disconn(Conn* c)       //解除连接 
+{
+    int fd=c->fdg();
+    timer_set.erase({c->last_active,fd});
+    Epoll_ctl(efd, EPOLL_CTL_DEL, fd, nullptr);
+    c->closeallfd();
+    clients.erase(fd);
+}
+void Worker::run()
+{
+
     epoll_event events[1024];       //max epoll 1024
     while(1)
     {
@@ -481,54 +530,52 @@ void HttpServer::epollstart()           //epoll树创建和循环wait
         {
             for(int i=0;i<n;i++)
             {
-                if(events[i].data.fd==this->lfd)
+                int nowfd=events[i].data.fd;
+                if(nowfd==wakeup_fd)
                 {
-                    this->epolladd();
+                    //唤醒线程，说明有新的cfd来了在queue中 
+                    uint64_t one;
+                    read(wakeup_fd,&one,sizeof(one));
+                    int new_cfd;
+                    while(fd_queue.pop(new_cfd))
+                    {
+                        int ret=Workerepolladd(new_cfd);
+                        if(ret<0)disconn(clients.find(new_cfd)->second.get());
+                    }
                 }
-                if(events[i].data.fd!=this->lfd)
+                else
                 {
-                    auto it=clients.find(events[i].data.fd);
-                    if(it==clients.end())continue;
-                    auto c=it->second;
-                    c->handle_event(events[i].events);
+                    auto it=clients.find(nowfd);
+                    if(it!=clients.end())
+                    {
+                        it->second->handle_event(events[i].events);
+                    }
                 }
             }
         }
     }
 }
-void HttpServer::epolladd()             //this->lfd监听到后建立连接
+int Worker::Workerepolladd(int cfd)            //在queue中拿去并且挂到自己的树上
 {
-    sockaddr_in cli_addr;
-    socklen_t cli_len;
-    for(;;)
-    {
-        cli_len=sizeof(cli_addr);
-        int cfd=Accept4(this->lfd,(sockaddr*)&cli_addr,&cli_len,SOCK_NONBLOCK);
-        if(cfd==-2)break;       //-2代表缓冲区空 break退出循环
-        if(cfd==-1)return;      //处理Accept4的错误，省略不写了 
+    int opt = 1;
+    setsockopt(cfd, IPPROTO_TCP, TCP_NODELAY, &opt, sizeof(opt));
 
-        int opt = 1;
-        setsockopt(cfd, IPPROTO_TCP, TCP_NODELAY, &opt, sizeof(opt));
+    auto c=std::make_shared<Conn>(cfd,this);
+    this->clients[cfd]=c;
+    timer_set.insert(std::make_pair(c->last_active,cfd));
 
-        auto c=std::make_shared<Conn>(cfd,this);
-        this->clients[cfd]=c;
-        timer_set.insert(std::make_pair(c->last_active,cfd));
-
-        //将新的cfd挂上数
-        epoll_event tmp;
-        tmp.events=EPOLLIN|EPOLLET;     tmp.data.fd=cfd;   //113 21:55//给的是裸指针 shared智能管理
-        int ret=Epoll_ctl(this->efd,EPOLL_CTL_ADD,cfd,&tmp);
-        if(ret<0)this->disconn(c.get());
-    }
-}
-int HttpServer::setepoll(int fd,uint32_t events)          //设置epoll事件   -1代表错误  0代表成功设置
-{
     epoll_event ev;
-    ev.events   = events;
-    ev.data.fd=fd;
-    return Epoll_ctl(efd, EPOLL_CTL_MOD, fd, &ev);
+    ev.events=EPOLLIN|EPOLLET;  ev.data.fd=cfd;
+    int ret=Epoll_ctl(efd,EPOLL_CTL_ADD,cfd,&ev);
+    return ret;
 }
-void HttpServer::update_timer(int fd,time_t old_time,time_t new_time)
+void Worker::addConn(int cfd)       //往任务队列中添加任务并且唤醒线程
+{
+        fd_queue.push(cfd);
+        uint64_t one = 1;
+        write(wakeup_fd, &one, sizeof(one)); // 写 eventfd 唤醒 epoll
+}
+void Worker::update_timer(int fd,time_t old_time,time_t new_time)
 {
     auto it=timer_set.find({old_time,fd});
     if(it!=timer_set.end())
@@ -537,11 +584,10 @@ void HttpServer::update_timer(int fd,time_t old_time,time_t new_time)
     }
     timer_set.insert({new_time, fd});
 }
-void HttpServer::disconn(Conn* c)       //解除连接 
+int Worker::setepoll(int fd,uint32_t events)          //设置epoll事件   -1代表错误  0代表成功设置
 {
-    int fd=c->fdg();
-    timer_set.erase({c->last_active,fd});
-    Epoll_ctl(efd, EPOLL_CTL_DEL, fd, nullptr);
-    c->closeallfd();
-    clients.erase(fd);
+    epoll_event ev;
+    ev.events   = events;
+    ev.data.fd=fd;
+    return Epoll_ctl(efd, EPOLL_CTL_MOD, fd, &ev);
 }

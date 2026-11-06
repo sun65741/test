@@ -21,6 +21,11 @@
 #include<memory>
 #include<set>
 #include<netinet/tcp.h>
+#include <queue>
+#include <mutex>
+#include <condition_variable>
+#include <sys/eventfd.h>
+#include<thread>
 int Socket(int domain, int type, int protocol);
 int Bind(int sockfd, const struct sockaddr *addr,socklen_t addrlen);
 int Listen(int sockfd, int backlog);
@@ -30,11 +35,34 @@ int Epoll_ctl(int epfd, int op, int fd,struct epoll_event *event);
 int Epoll_wait(int epfd, struct epoll_event *events,int maxevents, int timeout);
 const char* get_file_type(const char* file);
 class HttpServer;
-
+class Worker;
+class Blockqueue{       //自定义数据
+public:
+    void push(int fd)
+    {
+        std::lock_guard<std::mutex> lock(mtx);
+        fd_queue.push(fd);
+        return;
+    }
+    bool pop(int& fd)
+    {
+        std::lock_guard<std::mutex> lock(mtx);
+        if(fd_queue.empty())
+        {
+            return false;
+        }
+        fd = fd_queue.front();
+        fd_queue.pop();
+        return true;
+    }
+private:
+    std::queue<int> fd_queue;
+    std::mutex mtx;
+};
 class Conn{
 private:
     int fd=-1;              //cfd连接文件描述符
-    HttpServer* srv = nullptr;   //  反向指针
+    Worker* srv = nullptr;   //  反向指针
     char rbuf[8192];        //读缓冲
     int rlen=0;             //读的字符长度
     int spos=0;             //消费的字符起始
@@ -59,7 +87,7 @@ private:
 
 public:
     time_t last_active;
-    explicit Conn(int c,HttpServer* s):fd(c),srv(s)
+    explicit Conn(int c,Worker* s):fd(c),srv(s)
     {
         rlen = 0;
         spos = 0;
@@ -84,10 +112,11 @@ public:
 class HttpServer{
 private:
     int lfd;        //监听文件描述符
+    std::vector<std::shared_ptr<Worker>> workers;
     int efd;        //Epoll create红黑树的根
     std::unordered_map<int,std::shared_ptr<Conn>> clients;
     void listencreat();         //端口我这次固定9876不改了
-    void epolladd();            //lfd监听到后建立连接  
+    int epolladd();            //lfd监听到后返回cfd
 
 public:
     std::set<std::pair<time_t, int>> timer_set;
@@ -97,7 +126,33 @@ public:
         efd=-1;
     }
     void epollstart();          //epoll树创建和循环wait
-    int setepoll(int fd,uint32_t events);       //设置epoll事件
     void disconn(Conn* c);      //解除连接
     void update_timer(int fd,time_t old_time,time_t new_time);
+};
+class Worker{
+public:
+    Worker(int f):workid(f)
+    {
+        efd=Epoll_create(1);    //创建属于这个线程的epoll树
+
+        wakeup_fd=eventfd(0,EFD_NONBLOCK);    //唤醒这个线程的fd
+        if(wakeup_fd==-1)
+            return;
+        epoll_event tmp;
+        tmp.events=EPOLLIN|EPOLLET; tmp.data.fd=wakeup_fd;
+        Epoll_ctl(efd,EPOLL_CTL_ADD,wakeup_fd,&tmp);
+    }
+    void run();
+    void disconn(Conn* c);
+    void addConn(int cfd);      //往任务队列中添加任务并且唤醒线程
+    int setepoll(int fd,uint32_t events);       //设置epoll事件
+    void update_timer(int fd,time_t old_time,time_t new_time);
+private:
+    int workid;
+    int efd;
+    int wakeup_fd;
+    Blockqueue fd_queue;
+    std::unordered_map<int,std::shared_ptr<Conn>> clients;
+    std::set<std::pair<time_t, int>> timer_set;
+    int Workerepolladd(int cfd);            //在queue中拿去并且挂到自己的树上
 };
