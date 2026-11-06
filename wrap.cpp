@@ -304,6 +304,7 @@ int Conn::try_sendall()       //尝试发送所有储存在Conn里的信息并�
             return -1;
         }
     }
+    srv->setepoll(fd,EPOLLIN|EPOLLET);
     return 0;
 }
 int Conn::pack_header(const char* f,int no,const char *desp,const char *type,struct stat& sbuf)       //打包要发送的协议头并且发送 -1error -2buf满 0正常发完
@@ -402,6 +403,10 @@ void Conn::reset_conn()
     phase=Stat::REQ_LINE;
     last_active=time(nullptr);
     srv->setepoll(fd,EPOLLIN|EPOLLET);
+    bzero(method,sizeof(method));
+    bzero(path,sizeof(path));
+    bzero(protocol,sizeof(protocol));
+    wbuf.clear();
 }
 void Conn::re_time()
 {
